@@ -28,6 +28,24 @@ from postprocess import (
 )
 
 
+# Optional outputs.
+PLOT_MESH = False
+PRINT_CONVERGENCE_RESULTS = False
+SAVE_CONVERGENCE_RESULTS = False
+PRINT_PLY_STRESS_RANGES = False
+PRINT_PLY_MAX_ABS = False
+PLOT_SELECTED_PLY_STRESSES = False
+PLOT_TRANSVERSE_DISPLACEMENT = False
+
+RESULTS_FILE = "convergence_results.csv"
+
+SELECTED_PLY_STRESS_PLOTS = [
+    (5, "bot", "sigma1"),
+    (0, "top", "FI_TW"),
+    (3, "top", "tau23"),
+]
+
+
 # Laminate definition.
 top = [np.pi/4, np.pi/2, 0]
 bottom = [np.pi/2, np.pi/4]
@@ -43,11 +61,11 @@ A, B, D, As, h, ply_data = CLT_FSDT(
 L = 450
 W = 220
 
-h=10
+h = 20
 Pe = 2
 
 hole_center = (70.1050, -40.5294)
-hole_radius = 15.0 
+hole_radius = 15.0
 
 patch_w = 40.0
 patch_h = 27.0
@@ -214,49 +232,48 @@ def create_plate_mesh_with_hole_and_patches(comm, h):
     return domain, cell_tags, facet_tags
 
 
-domain, cell_tags, facet_tags = create_plate_mesh_with_hole_and_patches(MPI.COMM_WORLD, h)
+def plot_plate_mesh_with_patches(domain, cell_tags):
+    """
+    Plot the generated mesh and physical cell tags.
 
+    Parameters
+    ----------
+    domain : dolfinx.mesh.Mesh
+        Computational domain.
+    cell_tags : dolfinx.mesh.MeshTags
+        Cell markers from the Gmsh model.
 
-# # Optional mesh plot.
-# def plot_plate_mesh_with_patches(domain, cell_tags):
-#     """
-#     Plot the generated mesh and physical cell tags.
-#     """
-#     if domain.comm.rank != 0:
-#         return
+    Returns
+    -------
+    None
+        Displays the mesh plot on MPI rank 0.
+    """
+    if domain.comm.rank != 0:
+        return
 
-#     topology, cell_types, geometry = plot.vtk_mesh(domain, domain.topology.dim)
-#     grid = pyvista.UnstructuredGrid(topology, cell_types, geometry)
+    topology, cell_types, geometry = plot.vtk_mesh(domain, domain.topology.dim)
+    grid = pyvista.UnstructuredGrid(topology, cell_types, geometry)
 
-#     num_local_cells = domain.topology.index_map(domain.topology.dim).size_local
-#     values = np.zeros(num_local_cells, dtype=np.int32)
+    num_local_cells = domain.topology.index_map(domain.topology.dim).size_local
+    values = np.zeros(num_local_cells, dtype=np.int32)
 
-#     if cell_tags is not None:
-#         tag_indices = cell_tags.indices
-#         tag_values = cell_tags.values
-#         values[tag_indices] = tag_values
+    if cell_tags is not None:
+        tag_indices = cell_tags.indices
+        tag_values = cell_tags.values
+        values[tag_indices] = tag_values
 
-#     grid.cell_data["cell_tags"] = values
+    grid.cell_data["cell_tags"] = values
 
-#     plotter = pyvista.Plotter()
-#     plotter.add_mesh(
-#         grid,
-#         scalars="cell_tags",
-#         show_edges=True,
-#         scalar_bar_args={"title": "Cell tags"},
-#         show_scalar_bar=False,
-#     )
-#     plotter.view_xy()
-#     plotter.show()
-    
-# plot_plate_mesh_with_patches(domain, cell_tags)
-
-
-# Function space: [ux, uy, uz, phix, phiy].
-V = fem.functionspace(domain, ("Lagrange", Pe, (5,)))
-
-dx = ufl.Measure("dx", domain=domain, subdomain_data=cell_tags)
-ds = ufl.Measure("ds", domain=domain, subdomain_data=facet_tags)
+    plotter = pyvista.Plotter()
+    plotter.add_mesh(
+        grid,
+        scalars="cell_tags",
+        show_edges=True,
+        scalar_bar_args={"title": "Cell tags"},
+        show_scalar_bar=False,
+    )
+    plotter.view_xy()
+    plotter.show()
 
 
 def clamped_boundary(x):
@@ -279,19 +296,6 @@ def clamped_boundary(x):
         | np.isclose(x[1], -W / 2)
         | np.isclose(x[1],  W / 2)
     )
-
-
-fdim = domain.topology.dim - 1
-boundary_facets = mesh.locate_entities_boundary(domain, fdim, clamped_boundary)
-
-u_D = np.zeros(5, dtype=default_scalar_type)
-boundary_dofs = fem.locate_dofs_topological(V, fdim, boundary_facets)
-bc = fem.dirichletbc(u_D, boundary_dofs, V)
-
-
-# FSDT strain measures.
-u = ufl.TrialFunction(V)
-du = ufl.TestFunction(V)
 
 
 def eps_2D_0(w):
@@ -359,6 +363,252 @@ def gamma(w):
     ])
 
 
+def print_convergence_results(
+    h_char,
+    Pe,
+    num_cells,
+    ndofs,
+    uz_max,
+    strain_energy,
+    external_work,
+    rel_balance,
+    u_components,
+    comp_max,
+    tracked_components,
+    global_max,
+    critical_ply,
+    ply_max,
+):
+    """
+    Print displacement, energy, stress and failure metrics.
+
+    Returns
+    -------
+    None
+        Prints values on MPI rank 0.
+    """
+    if MPI.COMM_WORLD.rank != 0:
+        return
+
+    print()
+    print("Convergence-study quantities for this run:")
+    print(
+        f"{'h':>10s} {'Pe':>6s} {'cells':>12s} {'dofs':>12s} "
+        f"{'max|uz|':>16s} {'strain_energy':>16s} {'ext_work':>16s} {'rel_bal':>12s}"
+    )
+    print(
+        f"{h_char:10.3f} {Pe:6d} {num_cells:12d} {ndofs:12d} "
+        f"{uz_max:16.8e} {strain_energy:16.8e} {external_work:16.8e} {rel_balance:12.4e}"
+    )
+
+    print()
+    print("Max absolute value of each DOF component:")
+    for name in u_components:
+        print(f"  max|{name}| = {comp_max[name]:.8e}")
+
+    print()
+    print("Global maximum stress / failure metrics across all plies:")
+    for comp in tracked_components:
+        print(
+            f"  max|{comp}| = {global_max[comp]:.8e}   "
+            f"(critical ply = {critical_ply[comp]})"
+        )
+
+    print()
+    print("Per-ply maximum absolute local stress components and failure indices:")
+    for ply_id, comps in ply_max.items():
+        print(f"\nPly {ply_id}:")
+        for comp in tracked_components:
+            if comp in comps:
+                print(f"  {comp:12s}: {comps[comp]:.8e}")
+
+    print()
+    print("Work/energy consistency check (linear static):")
+    print(f"  external_work         = {external_work:.8e}")
+    print(f"  2 * strain_energy     = {2.0 * strain_energy:.8e}")
+    print(f"  relative difference   = {rel_balance:.8e}")
+
+
+def save_convergence_results(
+    results_file,
+    h_char,
+    Pe,
+    num_cells,
+    ndofs,
+    comp_max,
+    strain_energy,
+    external_work,
+    rel_balance,
+    global_max,
+    critical_ply,
+):
+    """
+    Append convergence quantities to a CSV file.
+
+    Returns
+    -------
+    None
+        Writes one row on MPI rank 0.
+    """
+    if MPI.COMM_WORLD.rank != 0:
+        return
+
+    row = {
+        "h": h_char,
+        "Pe": Pe,
+        "cells": num_cells,
+        "dofs": ndofs,
+        "ux_max": comp_max["ux"],
+        "uy_max": comp_max["uy"],
+        "uz_max": comp_max["uz"],
+        "phix_max": comp_max["phix"],
+        "phiy_max": comp_max["phiy"],
+        "strain_energy": strain_energy,
+        "ext_work": external_work,
+        "rel_balance": rel_balance,
+        "max_sigma1": global_max["sigma1"],
+        "max_sigma2": global_max["sigma2"],
+        "max_tau12": global_max["tau12"],
+        "max_tau13": global_max["tau13"],
+        "max_tau23": global_max["tau23"],
+        "max_FI_TW": global_max["FI_TW"],
+        "max_FI_tau13": global_max["FI_tau13"],
+        "max_FI_tau23": global_max["FI_tau23"],
+        "max_FI_oop_shear": global_max["FI_oop_shear"],
+        "crit_ply_sigma1": critical_ply["sigma1"],
+        "crit_ply_sigma2": critical_ply["sigma2"],
+        "crit_ply_tau12": critical_ply["tau12"],
+        "crit_ply_tau13": critical_ply["tau13"],
+        "crit_ply_tau23": critical_ply["tau23"],
+        "crit_ply_FI_TW": critical_ply["FI_TW"],
+        "crit_ply_FI_tau13": critical_ply["FI_tau13"],
+        "crit_ply_FI_tau23": critical_ply["FI_tau23"],
+        "crit_ply_FI_oop_shear": critical_ply["FI_oop_shear"],
+    }
+
+    fieldnames = [
+        "h",
+        "Pe",
+        "cells",
+        "dofs",
+        "ux_max",
+        "uy_max",
+        "uz_max",
+        "phix_max",
+        "phiy_max",
+        "strain_energy",
+        "ext_work",
+        "rel_balance",
+        "max_sigma1",
+        "max_sigma2",
+        "max_tau12",
+        "max_tau13",
+        "max_tau23",
+        "max_FI_TW",
+        "max_FI_tau13",
+        "max_FI_tau23",
+        "max_FI_oop_shear",
+        "crit_ply_sigma1",
+        "crit_ply_sigma2",
+        "crit_ply_tau12",
+        "crit_ply_tau13",
+        "crit_ply_tau23",
+        "crit_ply_FI_TW",
+        "crit_ply_FI_tau13",
+        "crit_ply_FI_tau23",
+        "crit_ply_FI_oop_shear",
+    ]
+
+    file_exists = os.path.isfile(results_file)
+
+    with open(results_file, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+    print()
+    print(f"Saved convergence results to {results_file}")
+
+
+def plot_uz(domain, uh):
+    """
+    Plot transverse displacement u_z.
+
+    Parameters
+    ----------
+    domain : dolfinx.mesh.Mesh
+        Computational domain.
+    uh : dolfinx.fem.Function
+        Solved displacement and rotation field.
+
+    Returns
+    -------
+    None
+        Displays a PyVista plot on MPI rank 0.
+    """
+    if domain.comm.rank != 0:
+        return
+
+    uz = uh.sub(2).collapse()
+
+    V0 = fem.functionspace(domain, ("DG", 0))
+    uz_cell = fem.Function(V0)
+    uz_cell.interpolate(uz)
+
+    topology, cell_types, geometry = plot.vtk_mesh(domain, domain.topology.dim)
+    grid = pyvista.UnstructuredGrid(topology, cell_types, geometry)
+
+    num_local_cells = domain.topology.index_map(domain.topology.dim).size_local
+    name = "u_z"
+
+    grid.cell_data[name] = uz_cell.x.array[:num_local_cells]
+
+    plotter = pyvista.Plotter()
+    plotter.add_mesh(
+        grid,
+        scalars=name,
+        show_edges=False,
+        scalar_bar_args={
+            "title": name + "\n\n",
+            "vertical": True,
+            "position_x": 0.88,
+            "position_y": 0.1,
+            "width": 0.06,
+            "height": 0.8,
+            "fmt": "%.2f",
+            "label_font_size": 40,
+        },
+    )
+    plotter.show_axes()
+    plotter.view_xy()
+    plotter.show()
+
+
+domain, cell_tags, facet_tags = create_plate_mesh_with_hole_and_patches(MPI.COMM_WORLD, h)
+
+if PLOT_MESH:
+    plot_plate_mesh_with_patches(domain, cell_tags)
+
+
+# Function space: [ux, uy, uz, phix, phiy].
+V = fem.functionspace(domain, ("Lagrange", Pe, (5,)))
+
+dx = ufl.Measure("dx", domain=domain, subdomain_data=cell_tags)
+ds = ufl.Measure("ds", domain=domain, subdomain_data=facet_tags)
+
+fdim = domain.topology.dim - 1
+boundary_facets = mesh.locate_entities_boundary(domain, fdim, clamped_boundary)
+
+u_D = np.zeros(5, dtype=default_scalar_type)
+boundary_dofs = fem.locate_dofs_topological(V, fdim, boundary_facets)
+bc = fem.dirichletbc(u_D, boundary_dofs, V)
+
+
+# FSDT variational statement.
+u = ufl.TrialFunction(V)
+du = ufl.TestFunction(V)
+
 A_ufl = ufl.as_matrix(A.tolist())
 B_ufl = ufl.as_matrix(B.tolist())
 D_ufl = ufl.as_matrix(D.tolist())
@@ -385,10 +635,10 @@ L_form = 0
 
 for i in [1, 2, 3, 4]:
     p_i = fem.Constant(domain, P[i] / A_patch)
-    m_i = fem.Constant(domain, M[i] / A_patch)  
+    m_i = fem.Constant(domain, M[i] / A_patch)
 
     du_trans = ufl.as_vector([du[0], du[1], du[2]])
-    du_rot   = ufl.as_vector([du[3], du[4]])
+    du_rot = ufl.as_vector([du[3], du[4]])
 
     L_form += ufl.dot(p_i, du_trans) * dx(i)
     L_form += ufl.dot(m_i, du_rot) * dx(i)
@@ -496,189 +746,49 @@ for ply_id, comps in ply_max.items():
             critical_ply[comp] = ply_id
 
 
-# Optional convergence printout.
-# if domain.comm.rank == 0:
-#     print()
-#     print("Convergence-study quantities for this run:")
-#     print(
-#         f"{'h':>10s} {'Pe':>6s} {'cells':>12s} {'dofs':>12s} "
-#         f"{'max|uz|':>16s} {'strain_energy':>16s} {'ext_work':>16s} {'rel_bal':>12s}"
-#     )
-#     print(
-#         f"{h_char:10.3f} {Pe:6d} {num_cells:12d} {ndofs:12d} "
-#         f"{uz_max:16.8e} {strain_energy:16.8e} {external_work:16.8e} {rel_balance:12.4e}"
-#     )
+# Optional outputs.
+if PRINT_CONVERGENCE_RESULTS:
+    print_convergence_results(
+        h_char=h_char,
+        Pe=Pe,
+        num_cells=num_cells,
+        ndofs=ndofs,
+        uz_max=uz_max,
+        strain_energy=strain_energy,
+        external_work=external_work,
+        rel_balance=rel_balance,
+        u_components=u_components,
+        comp_max=comp_max,
+        tracked_components=tracked_components,
+        global_max=global_max,
+        critical_ply=critical_ply,
+        ply_max=ply_max,
+    )
 
-#     print()
-#     print("Max absolute value of each DOF component:")
-#     for name in u_components:
-#         print(f"  max|{name}| = {comp_max[name]:.8e}")
+if SAVE_CONVERGENCE_RESULTS:
+    save_convergence_results(
+        results_file=RESULTS_FILE,
+        h_char=h_char,
+        Pe=Pe,
+        num_cells=num_cells,
+        ndofs=ndofs,
+        comp_max=comp_max,
+        strain_energy=strain_energy,
+        external_work=external_work,
+        rel_balance=rel_balance,
+        global_max=global_max,
+        critical_ply=critical_ply,
+    )
 
-#     print()
-#     print("Global maximum stress / failure metrics across all plies:")
-#     for comp in tracked_components:
-#         print(
-#             f"  max|{comp}| = {global_max[comp]:.8e}   "
-#             f"(critical ply = {critical_ply[comp]})"
-#         )
+if PRINT_PLY_STRESS_RANGES:
+    print_ply_surface_stress_ranges(domain, ply_data, ply_surface_fields)
 
-#     print()
-#     print("Per-ply maximum absolute local stress components and failure indices:")
-#     for ply_id, comps in ply_max.items():
-#         print(f"\nPly {ply_id}:")
-#         for comp in tracked_components:
-#             if comp in comps:
-#                 print(f"  {comp:12s}: {comps[comp]:.8e}")
+if PRINT_PLY_MAX_ABS:
+    print_ply_max_abs(domain, ply_max)
 
-#     print()
-#     print("Work/energy consistency check (linear static):")
-#     print(f"  external_work         = {external_work:.8e}")
-#     print(f"  2 * strain_energy     = {2.0 * strain_energy:.8e}")
-#     print(f"  relative difference   = {rel_balance:.8e}")
+if PLOT_SELECTED_PLY_STRESSES:
+    for ply_id, side, component in SELECTED_PLY_STRESS_PLOTS:
+        plot_ply_surface_stress(domain, ply_surface_fields, ply_id, side, component)
 
-
-# Optional CSV storage for convergence results.
-# results_file = "convergence_results.csv"
-
-# row = {
-#     "h": h_char,
-#     "Pe": Pe,
-#     "cells": num_cells,
-#     "dofs": ndofs,
-#     "ux_max": comp_max["ux"],
-#     "uy_max": comp_max["uy"],
-#     "uz_max": comp_max["uz"],
-#     "phix_max": comp_max["phix"],
-#     "phiy_max": comp_max["phiy"],
-#     "strain_energy": strain_energy,
-#     "ext_work": external_work,
-#     "rel_balance": rel_balance,
-#     "max_sigma1": global_max["sigma1"],
-#     "max_sigma2": global_max["sigma2"],
-#     "max_tau12": global_max["tau12"],
-#     "max_tau13": global_max["tau13"],
-#     "max_tau23": global_max["tau23"],
-#     "max_FI_TW": global_max["FI_TW"],
-#     "max_FI_tau13": global_max["FI_tau13"],
-#     "max_FI_tau23": global_max["FI_tau23"],
-#     "max_FI_oop_shear": global_max["FI_oop_shear"],
-#     "crit_ply_sigma1": critical_ply["sigma1"],
-#     "crit_ply_sigma2": critical_ply["sigma2"],
-#     "crit_ply_tau12": critical_ply["tau12"],
-#     "crit_ply_tau13": critical_ply["tau13"],
-#     "crit_ply_tau23": critical_ply["tau23"],
-#     "crit_ply_FI_TW": critical_ply["FI_TW"],
-#     "crit_ply_FI_tau13": critical_ply["FI_tau13"],
-#     "crit_ply_FI_tau23": critical_ply["FI_tau23"],
-#     "crit_ply_FI_oop_shear": critical_ply["FI_oop_shear"],
-# }
-
-# if domain.comm.rank == 0:
-#     file_exists = os.path.isfile(results_file)
-
-#     fieldnames = [
-#         "h",
-#         "Pe",
-#         "cells",
-#         "dofs",
-#         "ux_max",
-#         "uy_max",
-#         "uz_max",
-#         "phix_max",
-#         "phiy_max",
-#         "strain_energy",
-#         "ext_work",
-#         "rel_balance",
-#         "max_sigma1",
-#         "max_sigma2",
-#         "max_tau12",
-#         "max_tau13",
-#         "max_tau23",
-#         "max_FI_TW",
-#         "max_FI_tau13",
-#         "max_FI_tau23",
-#         "max_FI_oop_shear",
-#         "crit_ply_sigma1",
-#         "crit_ply_sigma2",
-#         "crit_ply_tau12",
-#         "crit_ply_tau13",
-#         "crit_ply_tau23",
-#         "crit_ply_FI_TW",
-#         "crit_ply_FI_tau13",
-#         "crit_ply_FI_tau23",
-#         "crit_ply_FI_oop_shear",
-#     ]
-
-#     with open(results_file, "a", newline="") as f:
-#         writer = csv.DictWriter(f, fieldnames=fieldnames)
-#         if not file_exists:
-#             writer.writeheader()
-#         writer.writerow(row)
-
-#     print()
-#     print(f"Saved convergence results to {results_file}")
-
-
-# Post-processing.
-ply_surface_fields, V0 = compute_ply_surface_local_stresses(
-    domain=domain,
-    uh=uh,
-    ply_data=ply_data,
-    eps_2D_0=eps_2D_0,
-    chi=chi,
-    gamma=gamma,
-)
-
-# print_ply_surface_stress_ranges(domain, ply_data, ply_surface_fields)
-
-# ply_max = compute_ply_max_abs(ply_surface_fields)
-# print_ply_max_abs(domain, ply_max)
-
-# Optional stress and failure plots.
-# plot_ply_surface_stress(domain, ply_surface_fields, 5, "bot", "sigma1")
-# plot_ply_surface_stress(domain, ply_surface_fields, 0, "top", "FI_TW")
-# plot_ply_surface_stress(domain, ply_surface_fields, 3, "top", "tau23")
-
-
-# def plot_uz(domain, uh):
-#     """
-#     Plot transverse displacement u_z.
-#     """
-#     if domain.comm.rank != 0:
-#         return
-
-#     uz = uh.sub(2).collapse()
-
-#     V0 = fem.functionspace(domain, ("DG", 0))
-#     uz_cell = fem.Function(V0)
-#     uz_cell.interpolate(uz)
-
-#     topology, cell_types, geometry = plot.vtk_mesh(domain, domain.topology.dim)
-#     grid = pyvista.UnstructuredGrid(topology, cell_types, geometry)
-
-#     num_local_cells = domain.topology.index_map(domain.topology.dim).size_local
-#     name = "u_z"
-
-#     grid.cell_data[name] = uz_cell.x.array[:num_local_cells]
-
-#     plotter = pyvista.Plotter()
-#     plotter.add_mesh(
-#         grid,
-#         scalars=name,
-#         show_edges=False,
-#         scalar_bar_args={
-#             "title": name + "\n\n",
-#             "vertical": True,
-#             "position_x": 0.88,
-#             "position_y": 0.1,
-#             "width": 0.06,
-#             "height": 0.8,
-#             "fmt": "%.2f",
-#             "label_font_size": 40,
-#         },
-#     )
-#     plotter.show_axes()
-#     plotter.view_xy()
-#     plotter.show()
-    
-# plot_uz(domain, uh)
+if PLOT_TRANSVERSE_DISPLACEMENT:
+    plot_uz(domain, uh)
